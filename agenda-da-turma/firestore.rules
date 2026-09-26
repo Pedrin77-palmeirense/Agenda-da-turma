@@ -1,0 +1,289 @@
+rules_version = '2';
+
+// =====================================================================
+//  Agenda da Turma — regras de segurança do banco (Firestore)
+//  PARTE 4 de 4 (versão final)
+// =====================================================================
+//  O banco só deixa ler ou escrever o que estiver liberado aqui.
+//  O que não aparece aqui é proibido.
+//
+//  Estas regras rodam no servidor do Google, e não no navegador.
+//  Por isso ninguém consegue passar por cima delas mexendo no app.js.
+//
+//  Como publicar: console do Firebase > Firestore > aba Regras >
+//  apague tudo o que estiver lá, cole este arquivo inteiro e clique
+//  em Publicar.
+//
+//  Nunca use o "modo de teste" do Firestore: ele deixa QUALQUER pessoa
+//  da internet ler, mudar e apagar tudo.
+//
+//  Como o banco está organizado:
+//   codigos/{código}            qual grupo tem esse código (id e nome)
+//   grupos/{id}                 nome, série, escola, código, foto, membros,
+//                               admins e o nome e a foto do Google de cada membro
+//   grupos/{id}/pedidos/{uid}   pedido pra entrar (o id é o uid de quem pediu)
+//   grupos/{id}/itens/{id}      o que está marcado na agenda
+//   usuarios/{uid}              a foto que a pessoa escolheu no site
+// =====================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------- Funções de ajuda ----------------
+
+    function logado() {
+      return request.auth != null;
+    }
+
+    // O uid (o "RG" da conta) de quem está pedindo pra ler ou escrever
+    function eu() {
+      return request.auth.uid;
+    }
+
+    // Os dados de um grupo, lidos direto do banco
+    function grupo(grupoId) {
+      return get(/databases/$(database)/documents/grupos/$(grupoId)).data;
+    }
+
+    // Os dados de um grupo como ele vai ficar depois de salvar
+    // (serve pra conferir coisas que são salvas juntas, num lote)
+    function grupoDepois(grupoId) {
+      return getAfter(/databases/$(database)/documents/grupos/$(grupoId)).data;
+    }
+
+    function ehMembro(grupoId) {
+      return eu() in grupo(grupoId).membros;
+    }
+
+    function ehAdmin(grupoId) {
+      return eu() in grupo(grupoId).admins;
+    }
+
+    // Texto com tamanho entre min e max
+    function texto(valor, min, max) {
+      return valor is string && valor.size() >= min && valor.size() <= max;
+    }
+
+    // Foto do Google: vazia ou um endereço de foto do Google
+    function fotoOk(valor) {
+      return valor is string
+        && (valor == ''
+            || (valor.size() <= 1000
+                && valor.matches('https://[a-z0-9]+[.]googleusercontent[.]com/.*')));
+    }
+
+    // Foto feita pelo site: um JPEG pequeno, em texto ("base64").
+    // O limite de tamanho impede alguém de encher o banco com arquivos grandes.
+    function fotoDoSiteOk(valor) {
+      return valor is string
+        && valor.size() <= 60000
+        && valor.matches('data:image/jpeg;base64,[A-Za-z0-9+/]+=*');
+    }
+
+    // Nome e foto (do Google) de uma pessoa, e nada mais
+    function perfilOk(perfil) {
+      return perfil is map
+        && perfil.keys().hasOnly(['nome', 'foto'])
+        && texto(perfil.nome, 1, 80)
+        && fotoOk(perfil.foto);
+    }
+
+    // ---------------- Foto escolhida no site ----------------
+    // Quem está logado pode ver a foto de alguém (pra isso precisa saber o
+    // uid da pessoa, que só aparece pra quem está no mesmo grupo).
+    // Só a própria pessoa troca ou apaga a sua foto.
+    match /usuarios/{uid} {
+      allow get: if logado();
+      allow create, update: if logado()
+        && eu() == uid
+        && request.resource.data.keys().hasOnly(['foto', 'atualizadoEm'])
+        && fotoDoSiteOk(request.resource.data.foto)
+        && request.resource.data.atualizadoEm == request.time;
+      allow delete: if logado() && eu() == uid;
+    }
+
+    // ---------------- Códigos ----------------
+    // Quem digita um código consegue achar o grupo (só o id e o nome),
+    // mas ninguém consegue listar todos os códigos que existem.
+    match /codigos/{codigo} {
+      allow get: if logado();
+
+      // Um código só nasce junto com o seu grupo, e tem que ser o código dele.
+      // Se o código já existir, isto vira uma mudança, que é proibida:
+      // é assim que o app percebe que sorteou um código repetido.
+      allow create: if logado()
+        && request.resource.data.keys().hasOnly(['grupoId', 'nome'])
+        && request.resource.data.grupoId is string
+        && grupoDepois(request.resource.data.grupoId).codigo == codigo
+        && grupoDepois(request.resource.data.grupoId).nome == request.resource.data.nome
+        && eu() in grupoDepois(request.resource.data.grupoId).admins;
+
+      // Apagar: só um admin do grupo (na hora de apagar o grupo).
+      allow delete: if logado() && ehAdmin(resource.data.grupoId);
+
+      // Listar e mudar códigos: proibido.
+    }
+
+    // ---------------- Grupos ----------------
+    match /grupos/{grupoId} {
+
+      // O nome e a foto que o admin salvou são os mesmos do pedido da pessoa?
+      function igualAoPedido(uid, perfil) {
+        let pedido = get(/databases/$(database)/documents/grupos/$(grupoId)/pedidos/$(uid)).data;
+        return perfil == {'nome': pedido.nome, 'foto': pedido.foto};
+      }
+
+      // Aprovar = entra exatamente UMA pessoa em "membros", essa pessoa
+      // tinha pedido pra entrar, e o nome e a foto dela são os do pedido.
+      // Nada mais no grupo pode mudar junto.
+      function aprovandoUmPedido() {
+        let antes = resource.data;
+        let depois = request.resource.data;
+        let novos = depois.membros.removeAll(antes.membros);
+        return depois.diff(antes).affectedKeys().hasOnly(['membros', 'membrosInfo'])
+          && novos.size() == 1
+          && depois.membros.size() == antes.membros.size() + 1
+          && depois.membros.hasAll(antes.membros)
+          && depois.membros.size() <= 150
+          && depois.membrosInfo.diff(antes.membrosInfo).affectedKeys().hasOnly([novos[0]])
+          && igualAoPedido(novos[0], depois.membrosInfo[novos[0]]);
+      }
+
+      // Tornar ou tirar admin: só muda a lista "admins", todo admin
+      // precisa ser membro, e o grupo nunca fica sem admin.
+      function mudandoAdmins() {
+        let antes = resource.data;
+        let depois = request.resource.data;
+        return depois.diff(antes).affectedKeys().hasOnly(['admins'])
+          && depois.admins is list
+          && depois.admins.size() > 0
+          && antes.membros.hasAll(depois.admins);
+      }
+
+      // Tirar alguém: sai exatamente UMA pessoa de "membros", de "admins"
+      // (se for admin) e o nome e a foto dela somem do grupo.
+      function tirandoAlguem() {
+        let antes = resource.data;
+        let depois = request.resource.data;
+        let saiu = antes.membros.removeAll(depois.membros);
+        return depois.diff(antes).affectedKeys().hasOnly(['membros', 'membrosInfo', 'admins'])
+          && saiu.size() == 1
+          && depois.membros == antes.membros.removeAll(saiu)
+          && depois.admins == antes.admins.removeAll(saiu)
+          && depois.admins.size() > 0
+          && depois.membrosInfo.diff(antes.membrosInfo).affectedKeys().hasOnly(saiu)
+          && !(saiu[0] in depois.membrosInfo);
+      }
+
+      // Sair: igual a tirar alguém, só que a pessoa que sai é quem pediu.
+      function saindo() {
+        let antes = resource.data;
+        let depois = request.resource.data;
+        return depois.diff(antes).affectedKeys().hasOnly(['membros', 'membrosInfo', 'admins'])
+          && depois.membros == antes.membros.removeAll([eu()])
+          && depois.admins == antes.admins.removeAll([eu()])
+          && depois.admins.size() > 0
+          && depois.membrosInfo.diff(antes.membrosInfo).affectedKeys().hasOnly([eu()])
+          && !(eu() in depois.membrosInfo);
+      }
+
+      // Trocar a foto do grupo: só muda o campo "foto" (vazio = sem foto).
+      function mudandoFoto() {
+        return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['foto'])
+          && (request.resource.data.foto == '' || fotoDoSiteOk(request.resource.data.foto));
+      }
+
+      // Só quem é membro lê o grupo. A busca "meus grupos" do app funciona
+      // porque ela pede só os grupos que têm o meu uid em "membros".
+      allow read: if logado() && eu() in resource.data.membros;
+
+      // Criar: quem cria é o único membro e o único admin,
+      // e o código do grupo precisa ser salvo junto, apontando pra ele.
+      allow create: if logado()
+        && request.resource.data.keys().hasOnly(['nome', 'serie', 'escola', 'codigo', 'criadoPor', 'criadoEm', 'membros', 'admins', 'membrosInfo'])
+        && texto(request.resource.data.nome, 1, 60)
+        && texto(request.resource.data.serie, 0, 30)
+        && texto(request.resource.data.escola, 0, 80)
+        && request.resource.data.codigo is string
+        && request.resource.data.codigo.matches('[A-HJKMNP-Z2-9]{6}')
+        && request.resource.data.criadoPor == eu()
+        && request.resource.data.criadoEm == request.time
+        && request.resource.data.membros == [eu()]
+        && request.resource.data.admins == [eu()]
+        && request.resource.data.membrosInfo is map
+        && request.resource.data.membrosInfo.keys().hasOnly([eu()])
+        && perfilOk(request.resource.data.membrosInfo[eu()])
+        && getAfter(/databases/$(database)/documents/codigos/$(request.resource.data.codigo)).data.grupoId == grupoId;
+
+      // Mudar o grupo: admins aprovam pedidos, mudam os admins, tiram
+      // pessoas e trocam a foto. Qualquer membro pode sair.
+      allow update: if logado() && (
+        (eu() in resource.data.admins
+          && (aprovandoUmPedido() || mudandoAdmins() || tirandoAlguem() || mudandoFoto()))
+        || (eu() in resource.data.membros && saindo())
+      );
+
+      // Apagar o grupo: só admins. (O app apaga antes os itens, os pedidos e o código.)
+      allow delete: if logado() && eu() in resource.data.admins;
+
+      // ---------------- Pedidos pra entrar ----------------
+      // O id do pedido é o uid de quem pediu:
+      // cada pessoa só consegue ter um pedido por grupo.
+      match /pedidos/{uid} {
+        // Quem pediu vê o próprio pedido. Admins veem todos.
+        allow get: if logado() && (eu() == uid || ehAdmin(grupoId));
+        allow list: if logado() && ehAdmin(grupoId);
+
+        // Só dá pra pedir por si mesmo, sem já ser membro,
+        // e o pedido tem só nome, foto e a hora do servidor.
+        allow create: if logado()
+          && eu() == uid
+          && !(eu() in grupo(grupoId).membros)
+          && request.resource.data.keys().hasOnly(['nome', 'foto', 'criadoEm'])
+          && texto(request.resource.data.nome, 1, 80)
+          && fotoOk(request.resource.data.foto)
+          && request.resource.data.criadoEm == request.time;
+
+        // Quem pediu pode cancelar. Um admin pode recusar
+        // (ou apagar o pedido na hora de aprovar).
+        allow delete: if logado() && (eu() == uid || ehAdmin(grupoId));
+      }
+
+      // ---------------- Itens da agenda ----------------
+      match /itens/{itemId} {
+        // Um item certinho: só estes campos, com textos do tamanho
+        // certo, um dos 4 tipos e a data no formato AAAA-MM-DD.
+        function itemOk() {
+          let item = request.resource.data;
+          return item.keys().hasOnly(['titulo', 'tipo', 'materia', 'descricao', 'data', 'criadoPor', 'criadoEm'])
+            && texto(item.titulo, 1, 100)
+            && item.tipo in ['prova', 'trabalho', 'tarefa', 'outro']
+            && texto(item.materia, 0, 50)
+            && texto(item.descricao, 0, 1000)
+            && item.data is string
+            && item.data.matches('[0-9]{4}-[0-9]{2}-[0-9]{2}');
+        }
+
+        // Todo mundo do grupo vê a agenda.
+        allow read: if logado() && ehMembro(grupoId);
+
+        // Só admins marcam coisas, sempre no próprio nome e com a hora do servidor.
+        allow create: if logado()
+          && ehAdmin(grupoId)
+          && itemOk()
+          && request.resource.data.criadoPor == eu()
+          && request.resource.data.criadoEm == request.time;
+
+        // Editar (um desafio do LEIAME): só admins, sem mudar quem criou nem quando.
+        allow update: if logado()
+          && ehAdmin(grupoId)
+          && itemOk()
+          && request.resource.data.criadoPor == resource.data.criadoPor
+          && request.resource.data.criadoEm == resource.data.criadoEm;
+
+        // Apagar: só admins.
+        allow delete: if logado() && ehAdmin(grupoId);
+      }
+    }
+  }
+}
